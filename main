@@ -1,0 +1,893 @@
+import { useState, useEffect, useRef, useMemo } from "react";
+
+const STORAGE_KEY = "dream_journal_v2";
+const SETTINGS_KEY = "dream_settings_v1";
+
+// ── Persistence & Helpers ───────────────────────────────────────────────────
+function loadDreams() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; } catch { return []; } }
+function saveDreams(d) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch {} }
+
+function loadSettings() {
+  const defaults = {
+    aiProvider: "ollama",
+    aiUrl: "http://localhost:11434/v1/chat/completions",
+    aiModel: "llama3",
+    apiKey: ""
+  };
+  try { return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY)) }; } catch { return defaults; }
+}
+function saveSettings(s) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {} }
+
+const CHAT_KEY = "dream_chat_messages_v1";
+function loadChat() { try { return JSON.parse(localStorage.getItem(CHAT_KEY)) || []; } catch { return []; } }
+function saveChat(c) { try { localStorage.setItem(CHAT_KEY, JSON.stringify(c)); } catch {} }
+
+function genId() { return Math.random().toString(36).slice(2, 10); }
+function todayISO() { return new Date().toISOString().split("T")[0]; }
+function fmtDate(iso) { return new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" }); }
+function fmtShort(iso) { return new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month:"short", day:"numeric" }); }
+
+const TAGS = [
+  { id:"lucid",          label:"Lucid",           icon:"◎", color:"#facc15" },
+  { id:"vivid",          label:"Vivid",            icon:"✦", color:"#f472b6" },
+  { id:"nightmare",      label:"Nightmare",        icon:"◈", color:"#f87171" },
+  { id:"recurring",      label:"Recurring",        icon:"↻", color:"#fb923c" },
+  { id:"prophetic",      label:"Prophetic",        icon:"◆", color:"#34d399" },
+  { id:"sleep_paralysis",label:"Sleep Paralysis",  icon:"⊘", color:"#60a5fa" },
+];
+const EMOTIONS = ["Anxious","Peaceful","Confused","Excited","Terrified","Joyful","Melancholy","Euphoric"];
+const CLARITY  = ["Foggy","Hazy","Clear","Crystal"];
+
+// ── Starfield (Background) ──────────────────────────────────────────────────
+function Starfield() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const c = ref.current; if (!c) return;
+    const ctx = c.getContext("2d");
+    const resize = () => { c.width = window.innerWidth; c.height = window.innerHeight; };
+    resize(); window.addEventListener("resize", resize);
+    const stars = Array.from({ length:80 }, () => ({
+      x:Math.random(), y:Math.random(), r:Math.random()*1.2+0.2,
+      base:Math.random()*0.5+0.1, phase:Math.random()*Math.PI*2, speed:Math.random()*0.0008+0.0003,
+    }));
+    let raf;
+    const draw = t => {
+      ctx.clearRect(0,0,c.width,c.height);
+      stars.forEach(s => {
+        const o = s.base + Math.sin(t*s.speed+s.phase)*0.2;
+        ctx.beginPath(); ctx.arc(s.x*c.width, s.y*c.height, s.r, 0, Math.PI*2);
+        ctx.fillStyle = `rgba(220,210,255,${o.toFixed(2)})`; ctx.fill();
+      });
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
+  }, []);
+  return <canvas ref={ref} style={{ position:"fixed",inset:0,width:"100%",height:"100%",pointerEvents:"none",zIndex:0 }} />;
+}
+
+// ── Stats (Year-Month Overview) ─────────────────────────────────────────────
+function Stats({ dreams, onSelectDream }) {
+  const [activeYear, setActiveYear] = useState("all");
+  const [activeMonth, setActiveMonth] = useState("all");
+  const [selectedTag, setSelectedTag] = useState("all");
+  const [tooltip, setTooltip] = useState(null);
+
+  const showTooltip = (event, payload) => {
+    const maxWidth = 180;
+    const margin = 8;
+    const x = Math.min(Math.max(event.clientX + 8, margin), window.innerWidth - maxWidth - margin);
+    const y = Math.max(event.clientY - 92, margin + 20);
+    setTooltip({ ...payload, x, y });
+  };
+
+  const hideTooltip = () => setTooltip(null);
+
+  const clipText = str => (str && str.length > 40 ? str.slice(0, 40) + "..." : str || "");
+  
+
+  const availableYears = useMemo(() => {
+    const years = [...new Set(dreams.map(d => d.date.split("-")[0]))];
+    return years.sort((a, b) => b - a);
+  }, [dreams]);
+
+  const availableMonths = useMemo(() => {
+    if (activeYear === "all") return [];
+    const months = [...new Set(
+      dreams
+        .filter(d => d.date.startsWith(activeYear + "-"))
+        .map(d => d.date.split("-")[1].padStart(2, "0"))
+    )];
+    return months.sort().map(m => ({
+      value: m,
+      label: new Date(Number(activeYear), Number(m) - 1, 1).toLocaleString("en-US", { month: "long" })
+    }));
+  }, [dreams, activeYear]);
+
+  useEffect(() => { if (activeYear === "all") setActiveMonth("all"); }, [activeYear]);
+
+  const selectedBounds = useMemo(() => {
+    if (!dreams.length) return null;
+    if (activeYear === "all") {
+      const sorted = [...dreams].sort((a,b) => a.date.localeCompare(b.date));
+      return {
+        start: new Date(sorted[0].date + "T00:00:00").getTime(),
+        end: new Date(sorted[sorted.length-1].date + "T23:59:59").getTime()
+      };
+    }
+
+    const yearStart = new Date(Number(activeYear), 0, 1, 0, 0, 0).getTime();
+    const yearEnd = new Date(Number(activeYear), 11, 31, 23, 59, 59).getTime();
+    if (activeMonth !== "all") {
+      const monthIndex = Number(activeMonth) - 1;
+      const monthStart = new Date(Number(activeYear), monthIndex, 1, 0, 0, 0).getTime();
+      const monthEnd = new Date(Number(activeYear), monthIndex + 1, 1, 0, 0, 0).getTime() - 1;
+      return { start: monthStart, end: monthEnd };
+    }
+
+    return { start: yearStart, end: yearEnd };
+  }, [dreams, activeYear, activeMonth]);
+
+  const [animBounds, setAnimBounds] = useState(selectedBounds);
+
+  useEffect(() => {
+    if (!selectedBounds) return;
+    if (!animBounds) {
+      setAnimBounds(selectedBounds);
+      return;
+    }
+    const start = animBounds;
+    const duration = 400;
+    let startTime;
+    let raf;
+
+    const animate = (time) => {
+      if (!startTime) startTime = time;
+      const t = Math.min((time - startTime) / duration, 1);
+      setAnimBounds({
+        start: start.start + (selectedBounds.start - start.start) * t,
+        end: start.end + (selectedBounds.end - start.end) * t
+      });
+      if (t < 1) raf = requestAnimationFrame(animate);
+    };
+
+    raf = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(raf);
+  }, [selectedBounds]);
+
+  if (!dreams.length) return <div style={{textAlign:"center", color:"#6366f1", padding:70, fontFamily:"'Cinzel',serif"}}>NO DATA RECORDED</div>;
+
+  const currentBounds = animBounds || selectedBounds;
+  const span = Math.max(currentBounds.end - currentBounds.start, 1);
+  const getX = (dateStr) => {
+    const t = new Date(dateStr + "T12:00:00").getTime();
+    return ((t - currentBounds.start) / span) * 100;
+  };
+
+  const visibleDreams = useMemo(() => {
+    return dreams.filter(d => {
+      const t = new Date(d.date + "T12:00:00").getTime();
+      if (!selectedBounds || t < selectedBounds.start || t > selectedBounds.end) return false;
+      if (selectedTag !== "all" && !d.tags.includes(selectedTag)) return false;
+      if (activeYear !== "all" && activeMonth !== "all") {
+        return d.date.startsWith(`${activeYear}-${activeMonth}`);
+      }
+      return true;
+    });
+  }, [dreams, selectedBounds, activeYear, activeMonth, selectedTag]);
+
+  const sameDayGroups = useMemo(() => {
+    if (activeYear !== "all" && activeMonth !== "all") {
+      return visibleDreams.reduce((map, d) => {
+        map[d.date] = map[d.date] || [];
+        map[d.date].push(d);
+        return map;
+      }, {});
+    }
+    return {};
+  }, [visibleDreams, activeYear, activeMonth]);
+
+  const stats = useMemo(() => {
+    const total = visibleDreams.length;
+    const lucid = visibleDreams.filter(d => d.tags.includes("lucid")).length;
+    const nightmares = visibleDreams.filter(d => d.tags.includes("nightmare")).length;
+    const clarityCounts = visibleDreams.reduce((acc, d) => {
+      if (d.clarity) acc[d.clarity] = (acc[d.clarity] || 0) + 1;
+      return acc;
+    }, {});
+    const tagCounts = TAGS.reduce((acc, tag) => ({
+      ...acc,
+      [tag.id]: visibleDreams.filter(d => d.tags.includes(tag.id)).length
+    }), {});
+    return { total, lucid, nightmares, clarityCounts, tagCounts };
+  }, [visibleDreams]);
+
+  return (
+    <div className="timeline-chart" style={{opacity:1, transform:"translateY(0)", transition:"none"}}>
+      <div style={{display:"flex", gap:8, marginBottom:20, flexWrap:"wrap"}}>
+        <button onClick={() => setActiveYear("all")}
+          style={{ padding:"8px 16px", borderRadius:10, border:"1px solid rgba(167,139,250,0.2)", background: activeYear === "all" ? "rgba(109,40,217,0.5)" : "rgba(15,10,40,0.75)", color: "white", cursor:"pointer", fontSize:13, fontFamily:"'Cinzel',serif" }}>
+          ALL TIME
+        </button>
+        {availableYears.map(y => (
+          <button key={y} onClick={() => setActiveYear(y)}
+            style={{ padding:"8px 16px", borderRadius:10, border:"1px solid rgba(167,139,250,0.2)", background: activeYear === y ? "rgba(109,40,217,0.5)" : "rgba(15,10,40,0.75)", color: "white", cursor:"pointer", fontSize:13, fontFamily:"'Cinzel',serif" }}>
+            {y}
+          </button>
+        ))}
+        {activeYear !== "all" && (
+          <div style={{display:"flex", gap:8, flexWrap:"wrap", alignItems:"center"}}>
+            <button onClick={() => setActiveMonth("all")} style={{padding:"7px 12px", borderRadius:10, border:"1px solid rgba(167,139,250,0.2)", background: activeMonth === "all" ? "rgba(109,40,217,0.5)" : "rgba(15,10,40,0.75)", color:"white", cursor:"pointer", fontSize:13}}>All Months</button>
+            {availableMonths.map((m) => (
+              <button key={m.value} onClick={() => setActiveMonth(m.value)} style={{padding:"7px 12px", borderRadius:10, border:"1px solid rgba(167,139,250,0.2)", background: activeMonth === m.value ? "rgba(109,40,217,0.5)" : "rgba(15,10,40,0.75)", color:"white", cursor:"pointer", fontSize:13}}>{m.label}</button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={{ position:"relative", width:"100%", height:260, background:"rgba(8,5,25,0.7)", borderRadius:18, border:"1px solid rgba(167,139,250,0.2)", overflow:"hidden" }}>
+        <div style={{position:"absolute", left:20, right:20, top:"50%", height:2, background:"linear-gradient(90deg,transparent,rgba(167,139,250,0.5),transparent)"}} />
+        {visibleDreams.map(d => {
+          const x = getX(d.date);
+          const isLucid = d.tags.includes("lucid");
+          const isHov = tooltip?.type === "dream" && tooltip.dream?.id === d.id;
+
+          let yPercent = 50;
+          let lineTop = null;
+          let lineHeight = null;
+
+          if (activeYear !== "all" && activeMonth !== "all") {
+            const dayGroup = sameDayGroups[d.date] || [];
+            const index = dayGroup.findIndex(item => item.id === d.id);
+            yPercent = 50 - index * 8;
+            if (index > 0) {
+              lineTop = yPercent + 2;
+              lineHeight = 50 - lineTop;
+            }
+          }
+
+          return (
+            <div key={d.id}>
+              {lineTop !== null && lineHeight > 0 && (
+                <div style={{ position:"absolute", left:`${x}%`, top:`${lineTop}%`, width:2, height:`${lineHeight}%`, transform:"translateX(-50%)", background:"rgba(129,140,248,0.6)", borderRadius:1, zIndex:1 }} />
+              )}
+              <div onMouseEnter={(e) => showTooltip(e, { type:"dream", dream:d })} onMouseLeave={hideTooltip} onClick={(e) => { e.stopPropagation(); showTooltip(e, { type:"dream", dream:d }); }}
+                style={{ position:"absolute", left:`${x}%`, top:`${yPercent}%`, transform:"translate(-50%, -50%)", width: isHov ? 18 : 12, height: isHov ? 18 : 12, borderRadius:"50%", background: isLucid ? "#facc15" : "#7c3aed", boxShadow: isLucid ? "0 0 14px #facc15" : "none", transition: "all 0.2s", cursor:"pointer", zIndex: isHov ? 20 : 2 }}>
+                {isHov && (
+                  <div onClick={(e)=>{e.stopPropagation(); onSelectDream?.(d);}} style={{position:"absolute", bottom:20, left:"50%", transform:"translateX(-50%)", background:"#0d0820", border:"1px solid #a78bfa55", padding:"8px 12px", borderRadius:8, width:160, cursor:"pointer"}}>
+                    <div style={{fontSize:10, color:"#6366f1", marginBottom:2}}>{fmtDate(d.date)}</div>
+                    <div style={{fontSize:12, color:"#e2d9ff", lineHeight:1.3}}>{d.description?.slice(0,40)}...</div>
+                    <div style={{marginTop:6,fontSize:11,color:"#bdb5ff", textAlign:"right"}}>Open entry</div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {activeYear !== "all" && activeMonth !== "all" && visibleDreams.map(d => {
+          if (!d.false_awakenings || !d.false_awakenings.length) return null;
+          const x = getX(d.date);
+          return d.false_awakenings.map((fa, idx) => {
+            const yBase = 56 + idx * 7;
+            const prevY = idx === 0 ? 50 : 56 + (idx - 1) * 7;
+            const color = fa.led_to_lucid ? "rgb(98,252,98)" : "#60a5fa";
+            const isFaHov = tooltip?.type === "fa" && tooltip.dream?.id === d.id && tooltip.fa?.id === fa.id;
+            return (
+              <div key={d.id + "-fa-" + idx}>
+                <div style={{ position:"absolute", left:`${x}%`, top:`${prevY}%`, width:2, height:`${yBase - prevY}%`, transform:"translateX(-50%)", background:"rgba(96,165,250,0.6)", borderRadius:1, zIndex:0 }} />
+                <div onMouseEnter={() => setTooltip({ type:"fa", dream:d, fa })} onMouseLeave={() => setTooltip(null)} onClick={(e)=>{e.stopPropagation(); setTooltip({ type:"fa", dream:d, fa });}}
+                  style={{ position:"absolute", left:`${x}%`, top:`${yBase}%`, transform:"translate(-50%, -50%)", width: 10, height: 10, borderRadius:"50%", background: color, opacity:0.95, zIndex:6, cursor:"pointer" }}>
+                  {isFaHov && (
+                    <div style={{position:"absolute", top:"110%", left:"50%", transform:"translateX(-50%)", background:"#0d0820", border:"1px solid #3b82f6", padding:"7px 10px", borderRadius:8, width:170, whiteSpace:"normal", boxShadow:"0 6px 14px rgba(0,0,0,0.35)", zIndex:30}}>
+                      <div style={{fontSize:10, color:"#60a5fa", marginBottom:3}}>{fmtDate(d.date)} FA</div>
+                      <div style={{fontSize:11, color:"#e2d9ff", lineHeight:1.4}}>{fa.description || "False awakening event"}</div>
+                      <div style={{marginTop:6,fontSize:10,color:"#9df7a9"}}>{fa.led_to_lucid ? "Led to lucidity" : ""}</div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          });
+        })}
+      </div>
+      <div style={{marginTop:14, padding:"14px", borderRadius:14, background:"rgba(8,5,20,0.75)", border:"1px solid rgba(167,139,250,0.22)"}}>
+        <div style={{display:"flex", gap:8, flexWrap:"wrap", alignItems:"center", marginBottom:12}}>
+          <button onClick={() => setSelectedTag("all")}
+            style={{fontSize:13,padding:"8px 12px", borderRadius:10, border:"1px solid rgba(167,139,250,0.3)", background: selectedTag === "all" ? "rgba(109,40,217,0.5)" : "rgba(51,41,87,0.4)", color:"white", cursor:"pointer"}}>
+            All tags ({dreams.filter(d => {
+              const t = new Date(d.date + "T12:00:00").getTime();
+              return selectedBounds && t >= selectedBounds.start && t <= selectedBounds.end && (activeYear === "all" || (activeYear !== "all" && (activeMonth === "all" ? d.date.startsWith(`${activeYear}-`) : d.date.startsWith(`${activeYear}-${activeMonth}`))));
+            }).length})
+          </button>
+          {TAGS.map(tag => (
+            <button key={tag.id} onClick={() => setSelectedTag(tag.id)}
+              style={{fontSize:13,padding:"8px 12px", borderRadius:10,border:"1px solid rgba(167,139,250,0.3)", background: selectedTag === tag.id ? "rgba(109,40,217,0.5)" : "rgba(51,41,87,0.4)", color:"white", cursor:"pointer"}}>
+              {tag.icon} {tag.label} ({stats.tagCounts[tag.id] || 0})
+            </button>
+          ))}
+        </div>
+
+        <div style={{display:"flex", gap:16, flexWrap:"wrap", alignItems:"center", color:"#e2d9ff", fontSize:15, fontWeight:600}}>
+          <span>Total dreams: <strong>{stats.total}</strong></span>
+          <span>Lucid: <strong>{stats.lucid}</strong></span>
+          <span>Nightmares: <strong>{stats.nightmares}</strong></span>
+        </div>
+        <div style={{marginTop:10, display:"flex", gap:10, flexWrap:"wrap"}}>
+          {Object.entries(stats.clarityCounts).map(([clarity, count]) => (
+            <span key={clarity} style={{background:"rgba(124,58,237,0.25)", borderRadius:10, padding:"6px 10px", fontSize:13, color:"#c4b5fd"}}>{clarity}: {count}</span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── FA Editor & Modal (Restored UI) ─────────────────────────────────────────
+function FAEditor({ fa, index, onChange, onDelete }) {
+  return (
+    <div style={{background:"rgba(100,80,180,0.1)",border:"1px solid rgba(167,139,250,0.18)",borderRadius:10,padding:"12px 14px",marginTop:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <span style={{color:"#a78bfa",fontSize:10,fontFamily:"'Cinzel',serif",letterSpacing:2}}>↳ FALSE AWAKENING #{index+1}</span>
+        <button onClick={onDelete} style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",fontSize:18,lineHeight:1,padding:0}}>×</button>
+      </div>
+      <textarea value={fa.description} onChange={e=>onChange({...fa,description:e.target.value})}
+        placeholder="What made you think you woke up?" rows={2}
+        style={{width:"100%",background:"rgba(0,0,0,0.35)",border:"1px solid rgba(167,139,250,0.15)",borderRadius:6,color:"#e2d9ff",fontFamily:"'Lora',serif",fontSize:13,padding:"8px 10px",resize:"vertical",boxSizing:"border-box"}} />
+      <div style={{display:"flex",gap:16,marginTop:8}}>
+        <label style={{color:"#94a3b8",fontSize:12,cursor:"pointer"}}><input type="checkbox" checked={fa.realized} onChange={e=>onChange({...fa,realized:e.target.checked})} style={{marginRight:5}} />Realized</label>
+        <label style={{color:"#94a3b8",fontSize:12,cursor:"pointer"}}><input type="checkbox" checked={fa.led_to_lucid} onChange={e=>onChange({...fa,led_to_lucid:e.target.checked})} style={{marginRight:5}} />Led to lucidity</label>
+      </div>
+    </div>
+  );
+}
+
+function DreamModal({ dream, onSave, onClose }) {
+  const [form, setForm] = useState(dream || { id:genId(), date:todayISO(), description:"", tags:[], emotion:"", clarity:"Clear", lucid_trigger:"", false_awakenings:[] });
+  const toggle = id => setForm(f=>({...f, tags:f.tags.includes(id)?f.tags.filter(t=>t!==id):[...f.tags,id]}));
+  const addFA  = ()  => setForm(f=>({...f, false_awakenings:[...f.false_awakenings,{id:genId(),description:"",realized:false,led_to_lucid:false}]}));
+  const updFA  = (i,u)=> setForm(f=>{const a=[...f.false_awakenings];a[i]=u;return{...f,false_awakenings:a};});
+  const delFA  = i   => setForm(f=>({...f, false_awakenings:f.false_awakenings.filter((_,j)=>j!==i)}));
+
+  return (
+    <div className="dream-modal-overlay" onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:"fixed",inset:0,background:"rgba(2,0,14,0.86)",zIndex:100,overflow:"hidden"}}>
+      <div className="dream-modal-pane" style={{position:"absolute",left:0,right:0,bottom:0,height:"100%",background:"linear-gradient(160deg,#090618 0%,#0d0820 100%)",borderTopLeftRadius:18,borderTopRightRadius:18,overflowY:"auto",boxShadow:"0 -10px 30px rgba(0,0,0,0.35)",padding:"18px 16px 24px",transform:"translateY(0)",transition:"transform 220ms ease"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20, paddingTop:"env(safe-area-inset-top, 12px)"}}>
+          <h2 style={{color:"#e2d9ff",fontFamily:"'Cinzel',serif",fontSize:20,margin:0}}>{dream?"EDIT DREAM":"NEW DREAM"}</h2>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#6366f1",cursor:"pointer",fontSize:28,width:44,height:44,lineHeight:1,borderRadius:22,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+        </div>
+        <div style={{marginBottom:14}}>
+          <div style={{color:"#6366f1",fontSize:12,fontFamily:"'Cinzel',serif",marginBottom:6}}>DATE</div>
+          <input type="date" value={form.date} onChange={e=>setForm({...form,date:e.target.value})} style={{background:"rgba(0,0,0,0.4)",border:"1px solid rgba(167,139,250,0.2)",borderRadius:10,color:"#c4b5fd",padding:"12px 14px",width:"100%",boxSizing:"border-box",fontSize:16}} />
+        </div>
+        <div style={{marginBottom:14}}>
+          <div style={{color:"#6366f1",fontSize:12,fontFamily:"'Cinzel',serif",marginBottom:6}}>DESCRIPTION</div>
+          <textarea value={form.description} onChange={e=>setForm({...form,description:e.target.value})} placeholder="Describe your dream…" rows={5} style={{width:"100%",background:"rgba(0,0,0,0.4)",border:"1px solid rgba(167,139,250,0.2)",borderRadius:10,color:"#e2d9ff",fontFamily:"'Lora',serif",fontSize:16,padding:"12px 14px",boxSizing:"border-box",lineHeight:1.65,minHeight:132}} />
+        </div>
+        <div style={{marginBottom:14}}>
+          <div style={{color:"#6366f1",fontSize:12,fontFamily:"'Cinzel',serif",marginBottom:8}}>ATTRIBUTES</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {TAGS.map(tag=>(
+              <button key={tag.id} onClick={()=>toggle(tag.id)} style={{padding:"10px 14px",borderRadius:24,border:`1px solid ${form.tags.includes(tag.id)?tag.color:"rgba(167,139,250,0.15)"}`,background:form.tags.includes(tag.id)?`${tag.color}20`:"transparent",color:form.tags.includes(tag.id)?tag.color:"#6366f1",cursor:"pointer",fontSize:13,fontFamily:"'Cinzel',serif",minHeight:44,minWidth:44}}>
+                {tag.icon} {tag.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:12,marginBottom:14,flexWrap:"wrap"}}>
+          <div style={{flex:1,minWidth:150}}>
+            <div style={{color:"#6366f1",fontSize:12,fontFamily:"'Cinzel',serif",marginBottom:6}}>EMOTION</div>
+            <select value={form.emotion} onChange={e=>setForm({...form,emotion:e.target.value})} style={{width:"100%",background:"rgba(0,0,0,0.4)",border:"1px solid rgba(167,139,250,0.2)",borderRadius:10,color:"#e2d9ff",padding:"11px 12px",fontSize:16, minHeight:44}}>
+              <option value="">Select…</option>{EMOTIONS.map(e=><option key={e} value={e}>{e}</option>)}
+            </select>
+          </div>
+          <div style={{flex:1,minWidth:150}}>
+            <div style={{color:"#6366f1",fontSize:12,fontFamily:"'Cinzel',serif",marginBottom:6}}>CLARITY</div>
+            <select value={form.clarity} onChange={e=>setForm({...form,clarity:e.target.value})} style={{width:"100%",background:"rgba(0,0,0,0.4)",border:"1px solid rgba(167,139,250,0.2)",borderRadius:10,color:"#e2d9ff",padding:"11px 12px",fontSize:16, minHeight:44}}>
+              {CLARITY.map(c=><option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+        </div>
+        {form.tags.includes("lucid") && (
+          <div style={{marginBottom:14}}>
+            <div style={{color:"#facc15",fontSize:12,fontFamily:"'Cinzel',serif",marginBottom:6}}>◎ LUCIDITY TRIGGER</div>
+            <input value={form.lucid_trigger} onChange={e=>setForm({...form,lucid_trigger:e.target.value})} placeholder="What made you realize you were dreaming?" style={{width:"100%",background:"rgba(0,0,0,0.4)",border:"1px solid rgba(250,204,21,0.28)",borderRadius:10,color:"#fef08a",padding:"12px 14px",fontSize:16,boxSizing:"border-box",minHeight:44}} />
+          </div>
+        )}
+        <div style={{marginBottom:20}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{color:"#6366f1",fontSize:12,fontFamily:"'Cinzel',serif"}}>FALSE AWAKENINGS</div>
+            <button onClick={addFA} style={{background:"rgba(167,139,250,0.12)",border:"1px solid rgba(167,139,250,0.22)",borderRadius:8,color:"#a78bfa",padding:"10px 14px",fontSize:14,fontFamily:"'Cinzel',serif",minHeight:44}}>+ ADD FA</button>
+          </div>
+          {form.false_awakenings.map((fa,i)=><FAEditor key={fa.id} fa={fa} index={i} onChange={u=>updFA(i,u)} onDelete={()=>delFA(i)} />)}
+        </div>
+        <button onClick={()=>onSave(form)} style={{width:"100%",padding:"12px",background:"linear-gradient(135deg,#6d28d9,#9333ea)",border:"none",borderRadius:10,color:"white",fontFamily:"'Cinzel',serif",fontSize:12,cursor:"pointer",boxShadow:"0 0 24px rgba(109,40,217,0.35)"}}>
+          RECORD DREAM
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Dream Card & Analysis ───────────────────────────────────────────────────
+function DreamCard({ dream, onEdit, onDelete }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="dream-card" style={{background:"rgba(15,12,30,0.9)",border:"1px solid rgba(167,139,250,0.18)",borderRadius:14,padding:"16px 18px",marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div style={{flex:1,cursor:"pointer"}} onClick={()=>setOpen(!open)}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:7}}><span style={{color:"#9ca3af",fontFamily:"'Lora',serif",fontSize:11}}>{fmtDate(dream.date)}</span></div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:8}}>
+            {dream.tags.map(tid=>{const t=TAGS.find(x=>x.id===tid);return t?<span key={tid} style={{background:`${t.color}10`,border:`1px solid ${t.color}30`,borderRadius:20,padding:"2px 9px",color:t.color,fontSize:9}}>{t.icon} {t.label}</span>:null;})}
+          </div>
+          <p style={{color:open?"#e2d9ff":"#94a3b8",fontSize:16,lineHeight:1.7,margin:0}}>{open?dream.description:dream.description?.slice(0,120)+"…"}</p>
+        </div>
+        <div style={{display:"flex",gap:5,marginLeft:12}}><button onClick={()=>onEdit(dream)} style={{background:"none",border:"1px solid rgba(167,139,250,0.2)",color:"#6366f1",fontSize:10}}>edit</button><button onClick={()=>onDelete(dream.id)} style={{background:"none",border:"1px solid rgba(248,113,113,0.2)",color:"#f87171",fontSize:10}}>×</button></div>
+      </div>
+    </div>
+  );
+}
+
+function Analysis({ dreams, settings }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [load, setLoad] = useState(false);
+  const [err, setErr] = useState(null);
+  const chatWindowRef = useRef(null);
+
+  useEffect(() => { setMessages(loadChat()); }, []);
+  useEffect(() => { saveChat(messages); }, [messages]);
+  useEffect(() => { if (chatWindowRef.current) chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight; }, [messages]);
+
+  const clearHistory = () => { setMessages([]); setErr(null); setInput(""); };
+
+  const onSend = async () => {
+    const text = input.trim();
+    if (!text || load) return;
+
+    const userMsg = { id: genId(), role: "user", content: text, timestamp: Date.now() };
+    const history = [...messages, userMsg];
+    setMessages(history);
+    setInput("");
+    setLoad(true);
+    setErr(null);
+
+    const entries = dreams.slice(-80); // more context, compatible with 256k window
+    const contextSnippet = entries.length
+      ? entries.map(d => {
+          const tags = d.tags?.length ? `tags: ${d.tags.join(", ")}; ` : "";
+          const emotion = d.emotion ? `emotion: ${d.emotion}; ` : "";
+          const clarity = d.clarity ? `clarity: ${d.clarity}; ` : "";
+          const text = d.description?.slice(0, 2500).replace(/\n/g, " ") || "";
+          return `- ${fmtDate(d.date)} | ${tags}${emotion}${clarity}desc: ${text}${d.description?.length > 2500 ? "..." : ""}`;
+        }).join("\n").slice(0, 240000)
+      : "No dreams recorded yet.";
+
+    const systemInstruction = `You are a personal dream journal assistant with access to the user's recorded dreams. Use their dream history to give personalized, insightful responses — noticing patterns, recurring symbols, emotions, and themes across entries when relevant. Answer any question the user asks, whether or not it relates to their dreams. When it does relate, ground your response in their actual entries. Keep all responses concise and conversational. Plain text only — no markdown, no bullet points, no headers. \nCurrent dream journal entries:\n${contextSnippet}`;
+
+    const payloadMessages = [
+      { role: "system", content: systemInstruction },
+      ...history.map(m => ({ role: m.role, content: m.content }))
+    ];
+
+    const body = { model: settings.aiModel, messages: payloadMessages };
+    if (settings.aiProvider !== "openai") { body.stream = false; }
+
+    const headers = {
+      "Content-Type": "application/json",
+      ...(settings.aiProvider === "openai" && settings.apiKey ? { "Authorization": `Bearer ${settings.apiKey}` } : {})
+    };
+
+    try {
+      const res = await fetch(settings.aiUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body)
+      });
+      const json = await res.json();
+
+      if (!res.ok) {
+        throw new Error(json.error?.message || `HTTP ${res.status}`);
+      }
+
+      const raw = settings.aiProvider === "openai"
+        ? (json.choices?.[0]?.message?.content ?? json.choices?.[0]?.text ?? "")
+        : (json.choices?.[0]?.message?.content ?? json.message?.content ?? "");
+
+      const assistantMsg = { id: genId(), role: "assistant", content: (raw || "").trim() || "(empty response)", timestamp: Date.now() };
+      setMessages([...history, assistantMsg]);
+    } catch (e) {
+      setErr(`AI failed: ${e.message || e}. Ensure server/key is correct and online.`);
+    }
+
+    setLoad(false);
+  };
+
+  return (
+    <div style={{display:"flex", flexDirection:"column", height:"100%", gap:10, position:"relative"}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+        <h3 style={{margin:0, color:"#a78bfa", fontSize:14, fontFamily:"'Cinzel',serif"}}>AI Dream Chat</h3>
+        <button onClick={clearHistory} style={{background:"rgba(248,113,113,0.2)", border:"1px solid rgba(248,113,113,0.35)", color:"#fca5a5", borderRadius:8, padding:"6px 10px", fontSize:12}}>Clear</button>
+      </div>
+
+      <div ref={chatWindowRef} style={{flex:1, overflowY:"auto", paddingRight:4, paddingLeft:4, position:"relative"}}>
+        {messages.length === 0 ? (
+          <p style={{color:"#9ca3af", fontSize:12, margin:0}}>No conversation yet. Type below and press Send.</p>
+        ) : messages.map(m => (
+          <div key={m.id} style={{display:"flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom:10}}>
+            <div style={{maxWidth:"84%", padding:"10px 12px", borderRadius:10, background: m.role === "user" ? "rgba(99,102,241,0.25)" : "rgba(147,51,234,0.2)", color:"#e2d9ff", fontSize:15, whiteSpace:"pre-wrap", wordBreak:"break-word", lineHeight:1.5}}>{m.content}</div>
+          </div>
+        ))}
+        <div style={{height:90}} />
+      </div>
+
+      {err && <p style={{color:"#f87171", fontSize:12, margin:0}}>{err}</p>}
+      {load && <p style={{color:"#93c5fd", fontSize:12, margin:0, fontStyle:"italic"}}>AI is responding (may take a moment)...</p>}
+
+      <div style={{position:"fixed", left:16, right:16, bottom:"calc(72px + env(safe-area-inset-bottom, 0px))", display:"flex", gap:8, zIndex:96, background:"rgba(4,2,16,0.82)", borderRadius:12, border:"1px solid rgba(167,139,250,0.3)", padding:9}}>
+        <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), onSend())} placeholder="Type your question or reflection..." style={{flex:1, borderRadius:8, border:"1px solid rgba(167,139,250,0.35)", background:"rgba(0,0,0,0.35)", color:"#e2d9ff", padding:"10px 12px", fontSize:14}} />
+        <button onClick={onSend} disabled={load || !input.trim()} style={{padding:"10px 16px", background:"linear-gradient(135deg,#6d28d9,#4f46e5)", border:"none", borderRadius:8, color:"white", fontSize:13, cursor:"pointer", minWidth:88}}>
+          {load ? "Thinking…" : "Send"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SettingsPage({ settings, onSave }) {
+  const [form, setForm] = useState(settings);
+  return (
+    <div style={{maxWidth:500, margin:"0 auto", background:"rgba(15,12,30,0.6)", padding:25, borderRadius:16, border:"1px solid rgba(167,139,250,0.15)"}}>
+      <h3 style={{fontFamily:"'Cinzel',serif", fontSize:14, color:"#a78bfa", marginTop:0}}>AI CONFIGURATION</h3>
+      <div style={{marginBottom:16}}>
+        <label style={{display:"block", color:"#6366f1", fontSize:10, marginBottom:6}}>AI PROVIDER</label>
+        <select value={form.aiProvider} onChange={e => setForm({...form, aiProvider: e.target.value})} style={{width:"100%", background:"rgba(0,0,0,0.3)", border:"1px solid rgba(167,139,250,0.2)", padding:10, borderRadius:8, color:"#e2d9ff", fontSize:14}}>
+          <option value="ollama">OLLAMA</option>
+          <option value="openai">OpenAI</option>
+        </select>
+      </div>
+      <div style={{marginBottom:20}}>
+        <label style={{display:"block", color:"#6366f1", fontSize:10, marginBottom:6}}>BASE API URL</label>
+        <input value={form.aiUrl} onChange={e => setForm({...form, aiUrl: e.target.value})} style={{width:"100%", background:"rgba(0,0,0,0.3)", border:"1px solid rgba(167,139,250,0.2)", padding:10, borderRadius:8, color:"#e2d9ff"}} />
+      </div>
+      <div style={{marginBottom:20}}>
+        <label style={{display:"block", color:"#6366f1", fontSize:10, marginBottom:6}}>MODEL NAME</label>
+        <input value={form.aiModel} onChange={e => setForm({...form, aiModel: e.target.value})} placeholder="e.g. llama3" style={{width:"100%", background:"rgba(0,0,0,0.3)", border:"1px solid rgba(167,139,250,0.2)", padding:10, borderRadius:8, color:"#e2d9ff"}} />
+      </div>
+      {form.aiProvider === "openai" && (
+        <div style={{marginBottom:20}}>
+          <label style={{display:"block", color:"#6366f1", fontSize:10, marginBottom:6}}>OpenAI API Key</label>
+          <input type="password" value={form.apiKey} onChange={e => setForm({...form, apiKey: e.target.value})} placeholder="sk-..." style={{width:"100%", background:"rgba(0,0,0,0.3)", border:"1px solid rgba(167,139,250,0.2)", padding:10, borderRadius:8, color:"#e2d9ff"}} />
+        </div>
+      )}
+      <button onClick={() => onSave(form)} style={{width:"100%", padding:12, background:"#4f46e5", border:"none", borderRadius:8, color:"white", fontFamily:"'Cinzel',serif", fontSize:11, cursor:"pointer"}}>SAVE SETTINGS</button>
+    </div>
+  );
+}
+
+// ── Import Modal ─────────────────────────────────────────────────────────────
+function ImportModal({ onImport, onClose }) {
+  const [text, setText] = useState("");
+  const [err, setErr] = useState(null);
+  const [success, setSuccess] = useState(null);
+  const textareaRef = useRef(null);
+
+  const tryPasteFromClipboard = async () => {
+    try {
+      const pasted = await navigator.clipboard.readText();
+      setText(pasted);
+      setErr(null);
+    } catch {
+      setErr("Clipboard access denied — please long-press the box below and paste manually.");
+      textareaRef.current?.focus();
+    }
+  };
+
+  const doImport = () => {
+    setErr(null);
+    setSuccess(null);
+    const raw = text.trim();
+    if (!raw) { setErr("Nothing to import — paste your JSON first."); return; }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) throw new Error("Expected an array of dreams.");
+      const valid = parsed.filter(d => d && typeof d.id === "string" && typeof d.date === "string" && typeof d.description === "string");
+      if (!valid.length) throw new Error("No valid dream entries found.");
+      onImport(valid);
+      setSuccess(`${valid.length} dream${valid.length !== 1 ? "s" : ""} imported!`);
+      setText("");
+      setTimeout(onClose, 1400);
+    } catch (e) {
+      setErr(`Import failed: ${e?.message || e}`);
+    }
+  };
+
+  return (
+    <div onClick={e => e.target === e.currentTarget && onClose()}
+      style={{ position:"fixed", inset:0, background:"rgba(2,0,14,0.92)", zIndex:110, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"flex-end" }}>
+      <div style={{ width:"100%", maxWidth:600, background:"linear-gradient(160deg,#090618,#0d0820)", borderTopLeftRadius:20, borderTopRightRadius:20, padding:"20px 16px calc(20px + env(safe-area-inset-bottom,0px))", boxShadow:"0 -10px 40px rgba(0,0,0,0.5)" }}>
+
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+          <h2 style={{ margin:0, fontFamily:"'Cinzel',serif", fontSize:18, color:"#60a5fa" }}>IMPORT DREAMS</h2>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:"#6366f1", fontSize:28, cursor:"pointer", width:44, height:44, display:"flex", alignItems:"center", justifyContent:"center" }}>×</button>
+        </div>
+
+        <p style={{ color:"#9ca3af", fontSize:13, margin:"0 0 14px", lineHeight:1.5 }}>
+          Paste your exported JSON below, then tap <strong style={{color:"#93c5fd"}}>Import</strong>. Existing dreams with the same ID will be updated; new ones will be added.
+        </p>
+
+        <button onClick={tryPasteFromClipboard}
+          style={{ width:"100%", marginBottom:10, padding:"13px 10px", borderRadius:12, border:"1px solid rgba(96,165,250,0.5)", background:"rgba(96,165,250,0.18)", color:"#e2d9ff", fontSize:14, cursor:"pointer", fontFamily:"'Cinzel',serif", letterSpacing:1 }}>
+          PASTE FROM CLIPBOARD
+        </button>
+
+        <textarea
+          ref={textareaRef}
+          value={text}
+          onChange={e => { setText(e.target.value); setErr(null); setSuccess(null); }}
+          placeholder='Or long-press here and paste your JSON…'
+          rows={10}
+          style={{ width:"100%", background:"rgba(0,0,0,0.5)", border:`1px solid ${err ? "rgba(248,113,113,0.5)" : "rgba(167,139,250,0.2)"}`, borderRadius:12, color:"#c4b5fd", fontSize:11, fontFamily:"monospace", padding:"12px", resize:"none", boxSizing:"border-box", lineHeight:1.5, marginBottom:12 }}
+        />
+
+        {err && <p style={{ color:"#f87171", fontSize:12, margin:"0 0 10px" }}>{err}</p>}
+        {success && <p style={{ color:"#6ee7b7", fontSize:13, margin:"0 0 10px", fontFamily:"'Cinzel',serif" }}>✓ {success}</p>}
+
+        <button onClick={doImport} disabled={!text.trim()}
+          style={{ width:"100%", padding:"13px", borderRadius:12, border:"none", background: text.trim() ? "linear-gradient(135deg,#1d4ed8,#4f46e5)" : "rgba(30,30,60,0.5)", color: text.trim() ? "white" : "#4b5563", fontSize:14, cursor: text.trim() ? "pointer" : "default", fontFamily:"'Cinzel',serif", letterSpacing:1 }}>
+          IMPORT
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Export Modal ─────────────────────────────────────────────────────────────
+function ExportModal({ dreams, onClose }) {
+  const data = JSON.stringify(dreams, null, 2);
+  const [copied, setCopied] = useState(false);
+  const [shareErr, setShareErr] = useState(null);
+  const textareaRef = useRef(null);
+
+  const copyToClipboard = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(data);
+      } else {
+        // Fallback for WebViews without clipboard API
+        const ta = textareaRef.current;
+        ta.select();
+        ta.setSelectionRange(0, 99999);
+        document.execCommand("copy");
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } catch {
+      setShareErr("Copy failed — please long-press the text below and select all.");
+    }
+  };
+
+  const tryNativeShare = async () => {
+    setShareErr(null);
+    const filename = `dreams_${todayISO()}.json`;
+
+    // Try Capacitor Share plugin (requires @capacitor/share installed)
+    try {
+      const { Share } = await import("@capacitor/share");
+      await Share.share({
+        title: "Dream Journal Export",
+        text: data,
+        dialogTitle: "Share your dreams",
+      });
+      return;
+    } catch {}
+
+    // Try Web Share API with file
+    if (navigator.share) {
+      try {
+        const file = new File([data], filename, { type: "application/json" });
+        if (navigator.canShare?.({ files: [file] })) {
+          await navigator.share({ files: [file], title: "Dream Journal Export" });
+          return;
+        }
+        await navigator.share({ title: "Dream Journal Export", text: data });
+        return;
+      } catch (e) {
+        if (e.name === "AbortError") return;
+      }
+    }
+
+    setShareErr("Native share not available — use Copy above.");
+  };
+
+  return (
+    <div onClick={e => e.target === e.currentTarget && onClose()}
+      style={{ position:"fixed", inset:0, background:"rgba(2,0,14,0.92)", zIndex:110, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"flex-end" }}>
+      <div style={{ width:"100%", maxWidth:600, background:"linear-gradient(160deg,#090618,#0d0820)", borderTopLeftRadius:20, borderTopRightRadius:20, padding:"20px 16px calc(20px + env(safe-area-inset-bottom,0px))", boxShadow:"0 -10px 40px rgba(0,0,0,0.5)" }}>
+
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+          <h2 style={{ margin:0, fontFamily:"'Cinzel',serif", fontSize:18, color:"#a78bfa" }}>EXPORT DREAMS</h2>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:"#6366f1", fontSize:28, cursor:"pointer", width:44, height:44, display:"flex", alignItems:"center", justifyContent:"center" }}>×</button>
+        </div>
+
+        <p style={{ color:"#9ca3af", fontSize:13, margin:"0 0 14px", lineHeight:1.5 }}>
+          Your dream data as JSON. Tap <strong style={{color:"#c4b5fd"}}>Copy</strong> to copy it, then paste into a notes app, email, or file. Or tap <strong style={{color:"#c4b5fd"}}>Share</strong> to open the system share sheet.
+        </p>
+
+        <div style={{ display:"flex", gap:10, marginBottom:14 }}>
+          <button onClick={copyToClipboard}
+            style={{ flex:1, padding:"13px 10px", borderRadius:12, border:`1px solid ${copied ? "rgba(52,211,153,0.7)" : "rgba(99,102,241,0.6)"}`, background: copied ? "rgba(52,211,153,0.18)" : "rgba(99,102,241,0.25)", color: copied ? "#6ee7b7" : "#e2d9ff", fontSize:14, cursor:"pointer", fontFamily:"'Cinzel',serif", letterSpacing:1, transition:"all 0.2s" }}>
+            {copied ? "✓ COPIED!" : "COPY"}
+          </button>
+          <button onClick={tryNativeShare}
+            style={{ flex:1, padding:"13px 10px", borderRadius:12, border:"1px solid rgba(167,139,250,0.5)", background:"rgba(109,40,217,0.3)", color:"#e2d9ff", fontSize:14, cursor:"pointer", fontFamily:"'Cinzel',serif", letterSpacing:1 }}>
+            SHARE ↗
+          </button>
+        </div>
+
+        {shareErr && <p style={{ color:"#f87171", fontSize:12, margin:"0 0 10px" }}>{shareErr}</p>}
+
+        <div style={{ position:"relative" }}>
+          <div style={{ fontSize:11, color:"#6366f1", fontFamily:"'Cinzel',serif", letterSpacing:1, marginBottom:6 }}>
+            {dreams.length} DREAM{dreams.length !== 1 ? "S" : ""} · {(new Blob([data]).size / 1024).toFixed(1)} KB
+          </div>
+          <textarea
+            ref={textareaRef}
+            readOnly
+            value={data}
+            rows={10}
+            style={{ width:"100%", background:"rgba(0,0,0,0.5)", border:"1px solid rgba(167,139,250,0.2)", borderRadius:12, color:"#94a3b8", fontSize:11, fontFamily:"monospace", padding:"12px", resize:"none", boxSizing:"border-box", lineHeight:1.5 }}
+          />
+        </div>
+
+        <p style={{ color:"#4b5563", fontSize:11, margin:"10px 0 0", textAlign:"center" }}>
+          To import later, use the Import button on the journal screen.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ────────────────────────────────────────────────────────────────
+export default function App() {
+  const [dreams, setDreams] = useState(loadDreams);
+  const [settings, setSettings] = useState(loadSettings);
+  const [tab, setTab] = useState("journal");
+  const [modal, setModal] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [search, setSearch] = useState("");
+  const [panelScrollY, setPanelScrollY] = useState(0);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const appPanelRef = useRef(null);
+
+  const handleImport = (valid) => {
+    setDreams(current => {
+      const existing = Object.fromEntries(current.map(d => [d.id, d]));
+      valid.forEach(d => { existing[d.id] = d; });
+      return Object.values(existing).sort((a,b) => b.date.localeCompare(a.date));
+    });
+  };
+
+  useEffect(() => { saveDreams(dreams); }, [dreams]);
+  useEffect(() => { saveSettings(settings); }, [settings]);
+
+  useEffect(() => {
+    const panel = appPanelRef.current;
+    if (!panel) return;
+    const onScroll = () => setPanelScrollY(panel.scrollTop);
+    panel.addEventListener("scroll", onScroll, { passive: true });
+    return () => panel.removeEventListener("scroll", onScroll);
+  }, [appPanelRef]);
+
+  const save = d => { setDreams(p=>p.find(x=>x.id===d.id)?p.map(x=>x.id===d.id?d:x):[d,...p]); setModal(false); setEditing(null); };
+  const del = id => setDreams(p=>p.filter(d=>d.id!==id));
+  const edit = d => { setEditing(d); setModal(true); };
+
+  const filtered = dreams.filter(d=>{
+    const q=search.toLowerCase();
+    return !q||d.description?.toLowerCase().includes(q)||d.tags.some(t=>t.includes(q));
+  }).sort((a,b)=>b.date.localeCompare(a.date));
+
+  const tagSummary = TAGS.map(tag => ({
+    ...tag,
+    count: dreams.filter(d => d.tags.includes(tag.id)).length
+  })).filter(tag => tag.count > 0);
+
+  return (
+    <div style={{height:"100vh", width:"100vw", background:"#02010d", color:"#e2d9ff", fontFamily:"'Lora',serif", position:"relative", overflow:"hidden"}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Lora:ital,wght@0,400;0,500;1,400&display=swap');
+        * { box-sizing: border-box; }
+        html, body, #root { min-height: 100%; background: #02010d; margin: 0; }
+        input, textarea, select, button { outline: none; font-size: 16px; }
+        html, body { -webkit-text-size-adjust: 100%; -webkit-user-select: none; }
+        body { touch-action: manipulation; }
+
+        @media screen and (min-resolution: 440dpi) and (max-width: 420px) {
+          .app-panel { max-width: 420px; width: 100vw; margin: 48px auto 0; padding: 26px 16px 16px; }
+          .bottom-nav button, .fab, .tag-pill { min-height: 48px; }
+          h1 { font-size: 28px !important; letter-spacing: 2px; }
+          .dream-card p { font-size: 17px !important; }
+        }
+
+        @media (max-width: 430px) {
+          .app-panel { max-width: 430px; width: 100vw; }
+          .bottom-nav { padding-bottom: calc(14px + env(safe-area-inset-bottom, 8px)); }
+          .search-row input { font-size: 17px; }
+        }
+        button, input, textarea, select { -webkit-tap-highlight-color: transparent; }
+        button, .tag-pill, .nav-item, .fab { min-width: 44px; min-height: 44px; }
+        button, .nav-item, .fab { user-select: none; }
+
+        @media (max-width: 768px) {
+          h1 { font-size: 24px; }
+          .app-panel { padding: 14px !important; }
+          .search-row { flex-direction: column !important; gap: 10px !important; }
+          .search-row input { width: 100% !important; }
+          .dream-card { padding: 12px !important; }
+          .dream-modal-pane { max-width: 100% !important; padding: 16px !important; }
+          .timeline-chart { height: 160px !important; }
+        }
+      `}</style>
+
+      <div style={{position:"fixed", top:0, left:0, right:0, height:"env(safe-area-inset-top, 0px)", background:"#02010d", zIndex:99}} />
+      <Starfield />
+
+      <div ref={appPanelRef} className="app-panel" style={{position:"relative", zIndex:1, width:"100%", maxWidth:"100vw", margin:0, padding:"24px 16px 12px", height:"100vh", overflowY:"auto", overflowX:"hidden", overscrollBehavior:"contain", background:"linear-gradient(180deg, rgba(8,5,20,0.62), rgba(42,26,90,0.86) 40%, rgba(31,22,58,1))", backgroundAttachment:"fixed", backgroundPosition:`center ${Math.max(-panelScrollY*0.12, -80)}px`}}>
+        <header style={{textAlign:"center", marginBottom:34, paddingTop:"calc(20px + env(safe-area-inset-top, 0px))"}}>
+          <h1 style={{fontFamily:"'Cinzel',serif", fontSize:26, letterSpacing:2, margin:0, color:"#a78bfa"}}>Dream Journal</h1>
+          <div style={{fontSize:14, color:"#c4b5fd", letterSpacing:1.5, marginTop:6}}>Quick notes, insights and sleep log</div>
+        </header>
+
+        {tab === "journal" && tagSummary.length > 0 && (
+          <div style={{display:"flex", gap:8, overflowX:"auto", paddingBottom:12, marginBottom:12}}>
+            {tagSummary.map(tag => (
+              <div key={tag.id} className="tag-pill" style={{flex:"0 0 auto", background:`${tag.color}18`, border:`1px solid ${tag.color}45`, borderRadius:20, padding:"8px 12px", color:tag.color, fontSize:13, fontFamily:"'Cinzel',serif", minHeight:44, display:"flex", alignItems:"center", justifyContent:"center"}}>
+                {tag.label} ({tag.count})
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "journal" && (
+          <>
+            <div style={{display:"flex", gap:8, marginBottom:14, flexWrap:"wrap"}}>
+              <button onClick={() => setExportOpen(true)} style={{flex:1, minWidth:120, background:"rgba(99,102,241,0.3)", border:"1px solid rgba(99,102,241,0.6)", borderRadius:10, color:"#e2d9ff", padding:"10px 12px", fontSize:13, cursor:"pointer"}}>Export Dreams</button>
+              <button onClick={() => setImportOpen(true)} style={{flex:1, minWidth:120, background:"rgba(96,165,250,0.3)", border:"1px solid rgba(96,165,250,0.6)", borderRadius:10, color:"#e2d9ff", padding:"10px 12px", fontSize:13, cursor:"pointer"}}>Import Dreams</button>
+            </div>
+            <div className="search-row" style={{display:"flex", gap:10, marginBottom:16}}>
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search..." style={{flex:1, background:"rgba(8,5,20,0.7)", border:"1px solid rgba(167,139,250,0.16)", borderRadius:10, color:"#e2d9ff", padding:"12px 14px", minHeight:44}} />
+            </div>
+            {filtered.length===0 ? <div style={{textAlign:"center", padding:70, color:"#6366f1", fontFamily:"'Cinzel',serif"}}>NO DREAMS FOUND</div> : filtered.map(d=><DreamCard key={d.id} dream={d} onEdit={edit} onDelete={del} />)}
+          </>
+        )}
+
+        {tab === "stats" && <Stats dreams={dreams} onSelectDream={edit} />}
+        {tab === "analysis" && <Analysis dreams={dreams} settings={settings} />}
+        {tab === "settings" && <SettingsPage settings={settings} onSave={setSettings} />}
+      </div>
+
+      {tab === "journal" && (
+        <button className="fab" onClick={()=>{setEditing(null);setModal(true);}} style={{position:"fixed", right:20, bottom:"calc(84px + env(safe-area-inset-bottom, 0px))", width:56, height:56, borderRadius:"50%", border:"none", background:"linear-gradient(135deg,#7c3aed,#4f46e5)", color:"white", fontSize:28, lineHeight:1, display:"flex", alignItems:"center", justifyContent:"center", boxShadow:"0 10px 20px rgba(15,10,35,0.35)", zIndex:95, cursor:"pointer"}}>+</button>
+      )}
+
+      <div className="bottom-nav" style={{position:"fixed", bottom:0, left:0, right:0, background:"rgba(8,5,20,0.96)", borderTop:"1px solid rgba(167,139,250,0.2)", padding:"8px calc(10px + env(safe-area-inset-left,0px)) calc(12px + env(safe-area-inset-bottom,8px)) calc(10px + env(safe-area-inset-right,0px))", display:"grid", gridTemplateColumns:"repeat(4,1fr)", zIndex:90}}>
+        {[
+          { id:"journal", label:"Journal" },
+          { id:"stats", label:"Stats" },
+          { id:"analysis", label:"Analysis" },
+          { id:"settings", label:"Settings" }
+        ].map(item => (
+          <button key={item.id} className="nav-item" onClick={() => setTab(item.id)} style={{background:"none", border:"none", color: tab===item.id ? "#c4b5fd" : "#94a3b8", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:2, fontSize:14, padding:"8px 4px", minHeight:44}}>
+            <span style={{fontWeight:700}}>{item.label}</span>
+          </button>
+        ))}
+      </div>
+
+      {modal && <DreamModal dream={editing} onSave={save} onClose={()=>{setModal(false);setEditing(null);}} />}
+      {exportOpen && <ExportModal dreams={dreams} onClose={() => setExportOpen(false)} />}
+      {importOpen && <ImportModal onImport={handleImport} onClose={() => setImportOpen(false)} />}
+    </div>
+  );
+}
